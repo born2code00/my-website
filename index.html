@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Game Levels & Leaderboard (Supabase)</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+        body { font-family: Inter, Arial, sans-serif; padding: 20px; background: #fafafa; color:#111827 }
+        h1 { margin-top: 10px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        table, th, td { border: 1px solid #e5e7eb; }
+        th, td { padding: 10px; text-align: left; }
+        .level-item { margin: 6px 0; display:flex; justify-content:space-between; align-items:center }
+        code { background: #eee; padding: 2px 4px; }
+        .muted { color:#6b7280; }
+        .error { color:#b91c1c; }
+        .small { font-size:13px; }
+        button{padding:8px 10px;border-radius:8px;border:1px solid #ddd;background:white;cursor:pointer}
+    </style>
+</head>
+<body>
+
+<h1>Leaderboard</h1>
+<div class="small muted">Reads from <code>users</code> table (columns: username, deaths).</div>
+<table id="leaderboardTable">
+    <thead><tr><th>Player</th><th>Deaths</th></tr></thead>
+    <tbody id="leaderboardBody"><tr><td colspan="2" class="muted">Loading...</td></tr></tbody>
+</table>
+
+<h1 style="margin-top:22px">Download Levels</h1>
+<div class="small muted">Lists .tscn files from the <code>levels</code> storage bucket (public links).</div>
+<div id="levelsStatus" class="muted small" style="margin-top:6px">Loading...</div>
+<div id="levelsList" style="margin-top:8px"></div>
+
+<div style="margin-top:18px">
+    <button id="refreshBtn">Refresh</button>
+    <span id="globalStatus" class="small muted" style="margin-left:10px">—</span>
+</div>
+
+<script>
+export default async (req) => {
+  return new Response(
+    `<!DOCTYPE html><html><body>Hello</body></html>`,
+    { headers: { "Content-Type": "text/html" } }
+  );
+};
+
+// ------------------------------------------------------------------
+// CONFIGURE: replace with your Supabase project values
+// ------------------------------------------------------------------
+const SUPABASE_URL = "https://jaekvfwzikndnsfavaly.supabase.co"; // example
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImphZWt2Znd6aWtuZG5zZmF2YWx5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjI5NzAxMDQsImV4cCI6MjA3ODU0NjEwNH0.XOjZvB8sK1xghx0T_JZWbt6E9biG6oaf3Hc2iK-_ApM"; // put your anon key here
+const LEVEL_BUCKET = "levels"; // storage bucket name
+// ------------------------------------------------------------------
+
+function setGlobalStatus(text, isError=false){
+    const el = document.getElementById('globalStatus');
+    el.textContent = text;
+    el.className = isError ? 'small error' : 'small muted';
+}
+
+async function safeJsonResponse(res){
+    // try to parse JSON and handle server errors gracefully
+    let payload;
+    try{
+        payload = await res.json();
+    }catch(err){
+        console.error('JSON parse failed', err);
+        return { ok: false, data: null, error: 'Invalid JSON' };
+    }
+
+    if(!res.ok){
+        // Supabase often returns { message: '...', hint: ... } on errors
+        console.error('Request failed', res.status, payload);
+        return { ok: false, data: payload, error: payload && payload.message ? payload.message : ('HTTP ' + res.status) };
+    }
+
+    return { ok: true, data: payload, error: null };
+}
+
+async function sb(path, method='GET'){
+    const full = SUPABASE_URL + path;
+    try{
+        const res = await fetch(full, {
+            method,
+            headers: {
+                'Content-Type': 'application/json',
+                'apikey': SUPABASE_ANON_KEY,
+                'Authorization': 'Bearer ' + SUPABASE_ANON_KEY,
+                'Accept': 'application/json'
+            }
+        });
+        return await safeJsonResponse(res);
+    }catch(err){
+        console.error('Fetch failed', err);
+        return { ok: false, data: null, error: String(err) };
+    }
+}
+
+function ensureArray(v){
+    if(Array.isArray(v)) return v;
+    // Sometimes Supabase returns an object for single-row selects or errors; try to convert
+    if(v == null) return [];
+    if(typeof v === 'object'){
+        // if it has data property that's an array, use it
+        if(Array.isArray(v.data)) return v.data;
+        // if it's a single item, wrap in array
+        return [v];
+    }
+    // otherwise give empty array
+    return [];
+}
+
+// ------------------ Leaderboard ------------------
+async function loadLeaderboard(){
+    const tbody = document.getElementById('leaderboardBody');
+    tbody.innerHTML = '<tr><td colspan="2" class="muted">Loading...</td></tr>';
+    const res = await sb('/rest/v1/users?select=*&order=deaths.asc');
+    if(!res.ok){
+        tbody.innerHTML = `<tr><td colspan="2" class="error">Failed to load leaderboard: ${escapeHtml(res.error)}</td></tr>`;
+        setGlobalStatus('Leaderboard error', true);
+        return;
+    }
+    const data = ensureArray(res.data);
+    if(data.length === 0){
+        tbody.innerHTML = '<tr><td colspan="2" class="muted">No scores yet.</td></tr>';
+        setGlobalStatus('Loaded (no scores)');
+        return;
+    }
+
+    tbody.innerHTML = '';
+    data.forEach(row=>{
+        const tr = document.createElement('tr');
+        const name = escapeHtml(row.username || 'Unknown');
+        const score = escapeHtml(String(row.deaths ?? '0'));
+        tr.innerHTML = `<td>${name}</td><td>${score}</td>`;
+        tbody.appendChild(tr);
+    });
+    setGlobalStatus('Leaderboard loaded');
+}
+
+// ------------------ Levels (storage) ------------------
+async function loadLevels(){
+    const status = document.getElementById('levelsStatus');
+    const container = document.getElementById('levelsList');
+    status.textContent = 'Loading levels...';
+    container.innerHTML = '';
+
+    // Supabase storage list endpoint
+    try{
+        const listRes = await fetch(`${SUPABASE_URL}/storage/v1/object/list/${LEVEL_BUCKET}`, {
+            method: 'POST',
+            headers: {
+                'apikey': SUPABASE_ANON_KEY,
+                'Authorization': 'Bearer ' + SUPABASE_ANON_KEY,
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ prefix: '' })
+        });
+        const parsed = await safeJsonResponse(listRes);
+        if(!parsed.ok){
+            status.textContent = 'Failed to list bucket: ' + (parsed.error || 'Unknown');
+            setGlobalStatus('Levels error', true);
+            console.error('Storage list error', parsed.data);
+            return;
+        }
+
+        const files = ensureArray(parsed.data);
+        if(files.length === 0){
+            status.textContent = 'No files in bucket.';
+            setGlobalStatus('Loaded (no levels)');
+            return;
+        }
+
+        // Filter .tscn files and render
+        const tscnFiles = files.filter(f => typeof f.name === 'string' && f.name.toLowerCase().endsWith('.tscn'));
+        if(tscnFiles.length === 0){
+            status.textContent = 'No .tscn files found.';
+            setGlobalStatus('Loaded (no .tscn)');
+            return;
+        }
+
+        status.textContent = `Found ${tscnFiles.length} .tscn file(s).`;
+        setGlobalStatus('Levels loaded');
+
+        tscnFiles.forEach(f => {
+            const name = f.name;
+            const url = `${SUPABASE_URL}/storage/v1/object/public/${LEVEL_BUCKET}/${encodeURIComponent(name)}`;
+            const div = document.createElement('div');
+            div.className = 'level-item';
+            div.innerHTML = `
+                <div><b>${escapeHtml(name)}</b></div>
+                <div><a href="${url}" download>Download</a></div>
+            `;
+            container.appendChild(div);
+        });
+
+    }catch(err){
+        console.error('loadLevels failed', err);
+        status.textContent = 'Failed to load levels: ' + String(err);
+        setGlobalStatus('Levels error', true);
+    }
+}
+
+// ---------- Utilities ----------
+function escapeHtml(s){
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+// ---------- Init & Events ----------
+document.getElementById('refreshBtn').addEventListener('click', ()=>{ loadLeaderboard(); loadLevels(); });
+
+// initial load
+loadLeaderboard();
+loadLevels();
+
+</script>
+</body>
+</html>
